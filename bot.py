@@ -1,4 +1,5 @@
 import os
+import calendar
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -26,6 +27,8 @@ CRENEAUX = {
 }
 
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+MOIS = ("", "janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+        "août", "septembre", "octobre", "novembre", "décembre")
 
 
 def db():
@@ -353,6 +356,89 @@ def can_manage(interaction: discord.Interaction):
     )
 
 
+class CreationCalendar(discord.ui.View):
+    """Calendrier privé, limité à la personne qui prépare la partie."""
+
+    def __init__(self, owner_id, titre, creneau, jeu, places):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.titre, self.creneau, self.jeu, self.places = titre, creneau, jeu, places
+        today = datetime.now(TIMEZONE).date()
+        self.year, self.month = today.year, today.month
+        self.used = False
+        self.rebuild()
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("⛔ Ce calendrier appartient à une autre personne.", ephemeral=True)
+            return False
+        return True
+
+    def caption(self):
+        weeks = calendar.monthcalendar(self.year, self.month)
+        lines = [" Lu  Ma  Me  Je  Ve  Sa  Di"]
+        lines.extend(" ".join(f"{day:2d}" if day else "  " for day in week) for week in weeks)
+        return (f"📅 **{MOIS[self.month].capitalize()} {self.year}** — "
+                f"{CRENEAUX[self.creneau.value][0]}\n"
+                f"```text\n{chr(10).join(lines)}\n```"
+                "Choisis une date dans l'un des deux menus ci-dessous.")
+
+    def rebuild(self):
+        self.clear_items()
+        days = calendar.monthrange(self.year, self.month)[1]
+        today = datetime.now(TIMEZONE).date()
+        for start, end, row in ((1, 16, 0), (17, days, 1)):
+            options = [discord.SelectOption(
+                label=f"{day:02d}/{self.month:02d}/{self.year}",
+                value=str(day),
+                description=JOURS[datetime(self.year, self.month, day).weekday()].capitalize(),
+            ) for day in range(start, end + 1)
+                if datetime(self.year, self.month, day).date() >= today]
+            if not options:
+                continue
+            picker = discord.ui.Select(
+                placeholder=f"Choisir un jour du {start} au {end}",
+                options=options, row=row,
+            )
+
+            async def select(interaction, menu=picker):
+                if self.used:
+                    await interaction.response.send_message("ℹ️ Cette sélection a déjà été utilisée.", ephemeral=True)
+                    return
+                self.used = True
+                chosen = int(menu.values[0])
+                selected = datetime(self.year, self.month, chosen).strftime("%d/%m/%Y")
+                try:
+                    await partie_creer_date.callback(interaction, self.titre, selected,
+                                                     self.creneau, self.jeu, self.places)
+                except Exception:
+                    self.used = False
+                    raise
+
+            picker.callback = select
+            self.add_item(picker)
+
+        for label, action, disabled in (
+            ("◀ Mois", -1, self.year == today.year and self.month == today.month),
+            ("Mois ▶", 1, False),
+        ):
+            button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary,
+                                       disabled=disabled, row=2)
+
+            async def navigate(interaction, direction=action):
+                if self.used:
+                    await interaction.response.send_message("ℹ️ Cette sélection a déjà été utilisée.", ephemeral=True)
+                    return
+                offset = self.year * 12 + self.month - 1 + direction
+                self.year, self.month = divmod(offset, 12)
+                self.month += 1
+                self.rebuild()
+                await interaction.response.edit_message(content=self.caption(), view=self)
+
+            button.callback = navigate
+            self.add_item(button)
+
+
 @bot.tree.command(name="agenda", description="Affiche les prochaines séances JDR")
 async def agenda(interaction: discord.Interaction):
     conn = db()
@@ -394,7 +480,7 @@ async def agenda(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="partie_creer", description="Crée une nouvelle séance JDR")
+@bot.tree.command(name="partie_creer_date", description="Crée une séance en saisissant la date")
 @app_commands.describe(
     titre="Nom de la partie ou de la campagne",
     date="Date au format JJ/MM/AAAA",
@@ -407,7 +493,7 @@ async def agenda(interaction: discord.Interaction):
     app_commands.Choice(name="☀️ Après-midi", value="apres_midi"),
     app_commands.Choice(name="🌙 Soirée", value="soiree"),
 ])
-async def partie_creer(
+async def partie_creer_date(
     interaction: discord.Interaction,
     titre: str,
     date: str,
@@ -481,6 +567,27 @@ async def partie_creer(
         f"✅ Séance **#{event_id}** créée et publiée dans {target_channel.mention}.",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="partie_creer", description="Crée une séance en choisissant le jour dans un calendrier")
+@app_commands.describe(titre="Nom de la partie", creneau="Créneau horaire",
+                       jeu="Jeu de rôle", places="Nombre maximum de joueurs")
+@app_commands.choices(creneau=[
+    app_commands.Choice(name="🌞 Journée", value="journee"),
+    app_commands.Choice(name="☀️ Après-midi", value="apres_midi"),
+    app_commands.Choice(name="🌙 Soirée", value="soiree"),
+])
+async def partie_creer(
+    interaction: discord.Interaction, titre: str, creneau: app_commands.Choice[str],
+    jeu: str, places: app_commands.Range[int, 1, 30],
+):
+    if not can_manage(interaction):
+        await interaction.response.send_message(
+            "⛔ Seuls les organisateurs peuvent créer une séance.", ephemeral=True
+        )
+        return
+    view = CreationCalendar(interaction.user.id, titre, creneau, jeu, places)
+    await interaction.response.send_message(view.caption(), view=view, ephemeral=True)
 
 
 @bot.tree.command(name="partie_modifier", description="Modifie une séance que tu as créée")
