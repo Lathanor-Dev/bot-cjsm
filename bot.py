@@ -26,6 +26,9 @@ CRENEAUX = {
 }
 
 
+JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+
+
 def db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -113,7 +116,7 @@ def build_embed(event):
     embed = discord.Embed(
         title=f"🎲 {event['title']}",
         description=(
-            f"📅 **{dt.strftime('%A %d/%m/%Y')}**\n"
+            f"📅 **{JOURS[dt.weekday()].capitalize()} {dt.strftime('%d/%m/%Y')}**\n"
             f"{slot_name}\n"
             f"🎮 **Jeu :** {event['game'] or 'Non précisé'}"
         ),
