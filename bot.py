@@ -25,7 +25,6 @@ CRENEAUX = {
     "soiree": ("🌙 Soirée", 20),
 }
 
-
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
 
 
@@ -482,6 +481,111 @@ async def partie_creer(
         f"✅ Séance **#{event_id}** créée et publiée dans {target_channel.mention}.",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="partie_modifier", description="Modifie une séance que tu as créée")
+@app_commands.describe(
+    numero="Numéro de la partie (visible dans le message)",
+    titre="Nouveau titre (facultatif)",
+    date="Nouvelle date au format JJ/MM/AAAA (facultatif)",
+    creneau="Nouveau créneau (facultatif)",
+    jeu="Nouveau jeu (facultatif)",
+    places="Nouveau nombre de places (facultatif)",
+)
+@app_commands.choices(creneau=[
+    app_commands.Choice(name="🌞 Journée", value="journee"),
+    app_commands.Choice(name="☀️ Après-midi", value="apres_midi"),
+    app_commands.Choice(name="🌙 Soirée", value="soiree"),
+])
+async def partie_modifier(
+    interaction: discord.Interaction,
+    numero: int,
+    titre: str | None = None,
+    date: str | None = None,
+    creneau: app_commands.Choice[str] | None = None,
+    jeu: str | None = None,
+    places: app_commands.Range[int, 1, 30] | None = None,
+):
+    event = get_event(numero)
+    if not event or event["guild_id"] != interaction.guild_id or event["cancelled"]:
+        await interaction.response.send_message("❌ Partie introuvable ou annulée.", ephemeral=True)
+        return
+
+    if interaction.user.id != event["game_master_id"]:
+        await interaction.response.send_message(
+            "⛔ Seule la personne qui a créé cette partie peut la modifier.", ephemeral=True
+        )
+        return
+
+    if all(value is None for value in (titre, date, creneau, jeu, places)):
+        await interaction.response.send_message("❌ Indique au moins un champ à modifier.", ephemeral=True)
+        return
+
+    if titre is not None and not titre.strip():
+        await interaction.response.send_message("❌ Le titre ne peut pas être vide.", ephemeral=True)
+        return
+
+    if jeu is not None and not jeu.strip():
+        await interaction.response.send_message("❌ Le jeu ne peut pas être vide.", ephemeral=True)
+        return
+
+    try:
+        new_date = datetime.strptime(date, "%d/%m/%Y").date().isoformat() if date else event["event_date"]
+    except ValueError:
+        await interaction.response.send_message("❌ Format de date invalide. Utilise JJ/MM/AAAA.", ephemeral=True)
+        return
+
+    new_slot = creneau.value if creneau else event["slot"]
+    proposed = {"event_date": new_date, "slot": new_slot}
+    if event_datetime(proposed) <= datetime.now(TIMEZONE):
+        await interaction.response.send_message("❌ La séance doit être dans le futur.", ephemeral=True)
+        return
+
+    new_places = places if places is not None else event["max_players"]
+    confirmed = participant_counts(numero)["confirmed"]
+    if new_places < confirmed:
+        await interaction.response.send_message(
+            f"❌ Il y a déjà {confirmed} personnes inscrites : impossible de réduire à {new_places} places.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    schedule_changed = new_date != event["event_date"] or new_slot != event["slot"]
+    conn = db()
+    conn.execute("""
+        UPDATE events SET title = ?, game = ?, event_date = ?, slot = ?,
+            max_players = ?, reminder_7_sent = ?, reminder_1_sent = ?
+        WHERE id = ? AND guild_id = ? AND game_master_id = ? AND cancelled = 0
+    """, (
+        titre.strip() if titre is not None else event["title"],
+        jeu.strip() if jeu is not None else event["game"],
+        new_date, new_slot, new_places,
+        0 if schedule_changed else event["reminder_7_sent"],
+        0 if schedule_changed else event["reminder_1_sent"],
+        numero, interaction.guild_id, interaction.user.id,
+    ))
+    conn.commit()
+    conn.close()
+
+    if not event["message_id"]:
+        await interaction.followup.send(
+            "✅ Partie modifiée dans l'agenda, mais son message Discord est introuvable.", ephemeral=True
+        )
+        return
+
+    try:
+        channel = bot.get_channel(event["channel_id"]) or await bot.fetch_channel(event["channel_id"])
+        message = await channel.fetch_message(event["message_id"])
+        await message.edit(embed=build_embed(get_event(numero)), view=EventView(numero))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            "✅ Partie modifiée dans l'agenda, mais le message Discord n'a pas pu être actualisé. Vérifie le salon et les permissions du bot.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(f"✅ La partie **#{numero}** a été modifiée.", ephemeral=True)
 
 
 @bot.tree.command(name="partie_annuler", description="Annule une séance")
